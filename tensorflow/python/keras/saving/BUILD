@@ -47,8 +47,10 @@ py_library(
     ],
     srcs_version = "PY2AND3",
     deps = [
+        ":load_context",
         "//tensorflow/python:lib",
         "//tensorflow/python:math_ops",
+        "//tensorflow/python:platform",
         "//tensorflow/python:saver",
         "//tensorflow/python:tensor_spec",
         "//tensorflow/python/eager:def_function",
@@ -57,7 +59,8 @@ py_library(
         "//tensorflow/python/keras:optimizers",
         "//tensorflow/python/keras:regularizers",
         "//tensorflow/python/keras/engine:input_spec",
-        "//tensorflow/python/keras/mixed_precision/experimental:autocast_variable",
+        "//tensorflow/python/keras/mixed_precision:autocast_variable",
+        "//tensorflow/python/keras/protobuf:saved_metadata_proto_py",
         "//tensorflow/python/keras/utils:engine_utils",
         "//tensorflow/python/keras/utils:metrics_utils",
         "//tensorflow/python/keras/utils:mode_keys",
@@ -67,12 +70,24 @@ py_library(
     ],
 )
 
+py_library(
+    name = "load_context",
+    srcs = [
+        "saved_model/load_context.py",
+    ],
+    srcs_version = "PY2AND3",
+    deps = [],
+)
+
 tf_py_test(
     name = "metrics_serialization_test",
     size = "medium",
     srcs = ["metrics_serialization_test.py"],
     python_version = "PY3",
     shard_count = 8,
+    tags = [
+        "notsan",  # TODO(b/170870790)
+    ],
     deps = [
         "//tensorflow/python:client_testlib",
         "//tensorflow/python/keras",
@@ -96,9 +111,9 @@ tf_py_test(
 )
 
 tf_py_test(
-    name = "hdf5_format_test",
+    name = "save_weights_test",
     size = "medium",
-    srcs = ["hdf5_format_test.py"],
+    srcs = ["save_weights_test.py"],
     python_version = "PY3",
     shard_count = 4,
     tags = [
@@ -119,6 +134,7 @@ tf_py_test(
     size = "medium",
     srcs = ["save_test.py"],
     python_version = "PY3",
+    shard_count = 4,
     deps = [
         "//tensorflow/python:client_testlib",
         "//tensorflow/python/feature_column:feature_column_v2",
@@ -206,8 +222,8 @@ tf_py_test(
     size = "small",
     srcs = ["saved_model/json_utils_test.py"],
     python_version = "PY3",
-    tfrt_enabled = True,
     deps = [
+        ":saving",
         "//tensorflow/python:client_testlib",
         "//third_party/py/numpy",
         "@absl_py//absl/testing:parameterized",

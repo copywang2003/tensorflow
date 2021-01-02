@@ -231,7 +231,6 @@ cc_library(
     visibility = [
         "//tensorflow/compiler/mlir/tools/kernel_gen:__subpackages__",
         "//tensorflow/compiler/xla/service/gpu:__subpackages__",
-        "//tensorflow/compiler/xla/service/mlir_gpu:__subpackages__",
         "//tensorflow/core/kernels:__subpackages__",
         "//tensorflow/stream_executor:__subpackages__",
     ],
@@ -240,8 +239,8 @@ cc_library(
         ":gpu_driver_header",
         ":gpu_helpers_header",
         "//tensorflow/core:lib",
-        "//tensorflow/core:regexp_internal",
-        "//tensorflow/core:cuda_libdevice_path",
+        "//tensorflow/core/platform:regexp",
+        "//tensorflow/core/platform:cuda_libdevice_path",
         "//tensorflow/stream_executor/lib",
         "//tensorflow/stream_executor/platform",
         "@com_google_absl//absl/strings:str_format",
@@ -251,7 +250,8 @@ cc_library(
     ]) + if_cuda_is_configured([
         "//tensorflow/stream_executor/cuda:cuda_driver",
         "//tensorflow/stream_executor/cuda:ptxas_wrapper",
-    ]),
+        "//tensorflow/stream_executor/cuda:fatbinary_wrapper",
+    ]) + ["@com_google_absl//absl/container:flat_hash_set"],
 )
 
 cc_library(
@@ -271,9 +271,9 @@ cc_library(
         "@com_google_absl//absl/container:fixed_array",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:optional",
-        "//tensorflow/core:allocator",
+        "//tensorflow/core/framework:allocator",
         "//tensorflow/core:lib",
-        "//tensorflow/core:stream_executor_no_cuda",
+        "//tensorflow/core/platform:stream_executor_no_cuda",
         "//tensorflow/stream_executor:device_memory",
         "//tensorflow/stream_executor:device_memory_allocator",
         "//tensorflow/stream_executor:stream_executor_headers",

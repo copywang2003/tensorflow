@@ -60,6 +60,7 @@ Status AutotuneBufferSizes::OptimizeAndCollectStats(Cluster* cluster,
       graph_utils::AddScalarConstNode(data::model::kAutotune, &graph);
 
   absl::flat_hash_set<string> already_prefetched;
+
   // 1) Collect about all existing `PrefetchDataset` nodes, replacing
   // `prefetch(N)` with `prefetch(AUTOTUNE, buffer_size_min=N)` for all N !=-1.
   for (NodeDef& node : *output->mutable_node()) {
@@ -116,6 +117,7 @@ Status AutotuneBufferSizes::OptimizeAndCollectStats(Cluster* cluster,
     *prefetch_node.mutable_input()->Add() = async_dataset_node->name();
     // `buffer_size` input
     *prefetch_node.mutable_input()->Add() = autotune_value->name();
+
     for (const auto& attr_name : {"output_types", "output_shapes"}) {
       graph_utils::CopyAttribute(attr_name, *async_dataset_node,
                                  &prefetch_node);

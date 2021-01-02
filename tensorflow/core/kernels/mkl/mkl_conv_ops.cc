@@ -474,9 +474,23 @@ class MklConvOp : public OpKernel {
 
   explicit MklConvOp(OpKernelConstruction* context) : OpKernel(context) {
     OP_REQUIRES_OK(context, context->GetAttr("dilations", &dilations_));
+
+    // Conv and QuantizedConv ops have different padding attributes
+    // (`padding_list` versus `explicit_paddings`). But one and only one
+    // attribute is expected.
+    OP_REQUIRES(
+        context,
+        !(context->HasAttr("padding_list") &&
+          context->HasAttr("explicit_paddings")),
+        errors::InvalidArgument("Can only have 1 `padding` list at most"));
     if (context->HasAttr("padding_list")) {
       OP_REQUIRES_OK(context, context->GetAttr("padding_list", &padding_list_));
     }
+    if (context->HasAttr("explicit_paddings")) {
+      OP_REQUIRES_OK(context,
+                     context->GetAttr("explicit_paddings", &padding_list_));
+    }
+
     OP_REQUIRES_OK(context, context->GetAttr("strides", &strides_));
     string data_format;
     OP_REQUIRES_OK(context, context->GetAttr("data_format", &data_format));
@@ -490,8 +504,9 @@ class MklConvOp : public OpKernel {
     const int64 stride_c = GetTensorDim(strides_, data_format_, 'C');
     OP_REQUIRES(
         context, stride_n == 1 && stride_c == 1,
-        errors::InvalidArgument("Current implementation does not yet support "
-                                "strides in the batch and depth dimensions."));
+        errors::Unimplemented("Current implementation does not yet support "
+                              "strides in the batch and depth dimensions."));
+
     OP_REQUIRES_OK(context, context->GetAttr("padding", &padding_));
     is_filter_const_ = false;
     if (context->HasAttr("is_filter_const")) {
@@ -554,19 +569,20 @@ class MklConvOp : public OpKernel {
           dilations, strides;
       memory::dims dst_dims_tf_order, dst_dims_mkl_order;
 
-      // For Quantized-Conv2D and Pad fusion, we get padding from the
-      // `padding_list` attribute. Otherwise, we get it from one of the inputs.
-      bool quantized_pad_enabled = false;
+      // For any Conv with `EXPLICIT` padding, get padding from `padding_list`
+      // attribute. Otherwise, get it from one of the inputs.
+      bool pad_attr_enabled = false;
       for (auto const& padding_val : padding_list_) {
         if (padding_val) {
-          quantized_pad_enabled = true;
+          pad_attr_enabled = true;
+
           break;
         }
       }
 
-      if (fuse_pad_ || quantized_pad_enabled) {
+      if (fuse_pad_ || pad_attr_enabled) {
         PadWithConvFusion(context, padding_left, padding_right,
-                          quantized_pad_enabled);
+                          pad_attr_enabled);
       }
 
       // Get shapes of input tensors in MKL-DNN order
@@ -578,7 +594,7 @@ class MklConvOp : public OpKernel {
       conv_utl.GetConvFwdSizesInMklOrder(
           src_tf_shape, filter_tf_shape, &src_dims, &filter_dims, &strides,
           &dilations, &dst_dims_tf_order, &dst_dims_mkl_order, &padding_left,
-          &padding_right, (fuse_pad_ || quantized_pad_enabled), is_depthwise);
+          &padding_right, (fuse_pad_ || pad_attr_enabled), is_depthwise);
 
       if (!context->status().ok()) return;
 
@@ -804,13 +820,12 @@ class MklConvOp : public OpKernel {
   }
 
   void PadWithConvFusion(OpKernelContext* context, memory::dims& padding_left,
-                         memory::dims& padding_right,
-                         bool quantized_pad_enabled) {
-    const Tensor& paddings_tf = MklGetInput(context, input_index_pad_);
+                         memory::dims& padding_right, bool pad_attr_enabled) {
     Tpadding* paddings = nullptr;
-    if (quantized_pad_enabled) {
+    if (pad_attr_enabled) {
       paddings = padding_list_.data();
     } else {
+      const Tensor& paddings_tf = MklGetInput(context, input_index_pad_);
       OP_REQUIRES(context, paddings_tf.dims() == 2,
                   errors::InvalidArgument("paddings must be 2-dimensional: ",
                                           paddings_tf.shape().DebugString()));
@@ -940,26 +955,19 @@ class MklConvOp : public OpKernel {
       const Tensor& add_tensor = MklGetInput(context, kInputIndex_Add);
       MklDnnShape add_mkl_shape;
       GetMklShape(context, kInputIndex_Add, &add_mkl_shape, native_format);
-      if (native_format) {
-        // Forward the summand tensor to the output only if it has no other
-        // references, otherwise make a copy of it.
-        if (!context->forward_input_to_output_with_shape(
-                kInputIndex_Add, kOutputIndex_Dst, output_tf_shape,
-                output_tensor)) {
-          AllocateOutputSetMklShape(context, kOutputIndex_Dst, output_tensor,
-                                    output_tf_shape, *output_mkl_shape,
-                                    native_format);
-          bool result =
-              (*output_tensor)->CopyFrom(add_tensor, add_tensor.shape());
-          DCHECK(result);
-        }
+      // Forward the summand tensor to the output only if it has no other
+      // references, otherwise make a copy of it.
+      if (native_format && context->forward_input_to_output_with_shape(
+                               kInputIndex_Add, kOutputIndex_Dst,
+                               output_tf_shape, output_tensor)) {
         return;
       }
       // Check if reorder is needed
-      if (add_mkl_shape == *output_mkl_shape) {
-        ForwardMklTensorInToOutWithMklShape(context, kInputIndex_Add,
-                                            kOutputIndex_Dst, add_mkl_shape);
-        *output_tensor = context->mutable_output(kOutputIndex_Dst);
+      if (!native_format && add_mkl_shape == *output_mkl_shape &&
+          ForwardMklTensorInToOutWithMklShape(context, kInputIndex_Add,
+                                              kOutputIndex_Dst, output_tensor,
+                                              add_mkl_shape, false)) {
+        return;
       } else {
         AllocateOutputSetMklShape(context, kOutputIndex_Dst, output_tensor,
                                   output_tf_shape, *output_mkl_shape,
@@ -985,6 +993,13 @@ class MklConvOp : public OpKernel {
             const_cast<Toutput*>(add_tensor.flat<Toutput>().data()));
         void* dst_buf =
             static_cast<void*>((*output_tensor)->flat<Ttemp_output>().data());
+        if (native_format) {
+          // We are simply deep copying the add_tensor to output_tensor without
+          // changing memory layout, hence using same memory descriptor.
+          ADD_MD = DST_MD =
+              memory::desc({add_tensor.NumElements()}, MklDnnType<Toutput>(),
+                           mkldnn::memory::format_tag::x);
+        }
         fuse_add_src_.reset(
             new MEMORY_CONSTRUCTOR(ADD_MD, this->cpu_engine_, add_buf));
         fuse_add_dst_.reset(
@@ -1887,7 +1902,7 @@ class MklQuantizedConv2DSumReluOp
       GetMklShape(context, summand_idx, &summand_mkl_shape);
       auto dst_md = summand_mkl_shape.GetMklLayout();
 
-      // TODO(mdfaijul): handle both non-MKL and MKL tensors
+      // TODO(intel-tf): Handle both non-MKL and MKL tensors
       if (summand_type == DT_QINT8) {
         OP_REQUIRES_OK(
             context, summand.BitcastFrom(summand, DT_QUINT8, summand.shape()));
@@ -1896,9 +1911,13 @@ class MklQuantizedConv2DSumReluOp
         summand_mkl_shape.SetMklLayout(&dst_md);
         summand_mkl_shape.SetElemType(MklDnnType<Toutput>());
       }
-      ForwardMklTensorInToOutWithMklShape(context, summand_idx, 0,
-                                          summand_mkl_shape);
-      *output_tensor = const_cast<Tensor*>(&summand);
+      // TODO(intel-tf): Support cases when summand cannot be forwarded.
+      OP_REQUIRES(
+          context,
+          ForwardMklTensorInToOutWithMklShape(
+              context, summand_idx, 0, output_tensor, summand_mkl_shape, false),
+          errors::InvalidArgument(
+              "Summand cannot be forwarded in the current fusion."));
       return;
     }
     MklConvOp<Device, Tinput, qint8, Tbias, Toutput, Ttemp_output, int32,

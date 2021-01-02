@@ -73,7 +73,6 @@ cuda_py_test(
     tags = COMMON_TAGS + [
         "no_oss_py38",  # TODO(b/162044699)
     ],
-    tfrt_enabled = True,
     deps = [
         ":profiler_lib",
         "//tensorflow:tensorflow_py",
@@ -85,7 +84,6 @@ cuda_py_test(
     name = "model_components_benchmarks_test",
     srcs = ["model_components_benchmarks_test.py"],
     python_version = "PY3",
-    tfrt_enabled = True,
     deps = [
         ":profiler_lib",
         "//tensorflow:tensorflow_py",
@@ -102,12 +100,22 @@ py_library(
     ],
 )
 
+py_test(
+    name = "benchmark_util_test",
+    srcs = ["benchmark_util_test.py"],
+    python_version = "PY3",
+    tags = COMMON_TAGS,
+    deps = [
+        ":benchmark_util",
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
 cuda_py_test(
     name = "bidirectional_lstm_benchmark_test",
     srcs = ["keras_examples_benchmarks/bidirectional_lstm_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
         ":profiler_lib",
@@ -120,9 +128,9 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/text_classification_transformer_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
     ],
 )
@@ -132,9 +140,9 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/antirectifier_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
     ],
 )
@@ -144,9 +152,9 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/mnist_conv_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
         "//third_party/py/numpy",
     ],
@@ -157,9 +165,9 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/mnist_hierarchical_rnn_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
     ],
 )
@@ -169,9 +177,9 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/mnist_irnn_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
     ],
 )
@@ -181,9 +189,9 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/reuters_mlp_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
         "//third_party/py/numpy",
     ],
@@ -194,9 +202,9 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/cifar10_cnn_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
         ":benchmark_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
     ],
 )
@@ -206,9 +214,10 @@ cuda_py_test(
     srcs = ["keras_examples_benchmarks/mnist_conv_custom_training_benchmark_test.py"],
     python_version = "PY3",
     tags = COMMON_TAGS,
-    tfrt_enabled = True,
     deps = [
+        ":benchmark_util",
         ":distribution_util",
+        ":profiler_lib",
         "//tensorflow:tensorflow_py",
     ],
 )
@@ -221,8 +230,23 @@ py_library(
     ],
 )
 
+py_test(
+    name = "optimizer_benchmarks_test",
+    srcs = ["optimizer_benchmarks_test.py"],
+    python_version = "PY3",
+    tags = COMMON_TAGS + [
+        "no_oss_py38",  # TODO(b/162044699)
+    ],
+    deps = [
+        ":benchmark_util",
+        ":profiler_lib",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python/keras/optimizer_v2",
+    ],
+)
+
 # Run memory profiler on Keras model.
-# Please make sure `meomry_profiler` is installed.
+# Please make sure `memory_profiler` is installed.
 # To run the memory profiler:
 # With CPU:
 #   bazel run -c opt model_memory_profile -- --model=YOUR_MODEL_NAME

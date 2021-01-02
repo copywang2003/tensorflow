@@ -35,6 +35,7 @@ from tensorflow.lite.python import wrap_toco
 from tensorflow.lite.toco import model_flags_pb2 as _model_flags_pb2
 from tensorflow.lite.toco import toco_flags_pb2 as _toco_flags_pb2
 from tensorflow.lite.toco import types_pb2 as _types_pb2
+from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.platform import resource_loader as _resource_loader
 from tensorflow.python.util import deprecation
@@ -125,7 +126,8 @@ class ConverterError(Exception):
 def mlir_quantize(input_data_str,
                   disable_per_channel=False,
                   fully_quantize=False,
-                  inference_type=_types_pb2.INT8):
+                  inference_type=_types_pb2.INT8,
+                  enable_numeric_verify=False):
   """Quantize `input_data_str` with calibration results.
 
   Args:
@@ -136,6 +138,8 @@ def mlir_quantize(input_data_str,
     fully_quantize: Bool indicating whether to fully quantize the model. Besides
       model body, the input/output will be quantized as well.
     inference_type: Data type for the activations. The default value is int8.
+    enable_numeric_verify: Experimental. Subject to change. Bool indicating
+      whether to add NumericVerify ops into the debug mode quantized model.
 
   Returns:
     Quantized model in serialized form (e.g. a TFLITE model) with floating-point
@@ -144,7 +148,8 @@ def mlir_quantize(input_data_str,
   return wrap_toco.wrapped_experimental_mlir_quantize(input_data_str,
                                                       disable_per_channel,
                                                       fully_quantize,
-                                                      inference_type)
+                                                      inference_type,
+                                                      enable_numeric_verify)
 
 
 def mlir_sparsify(input_data_str):
@@ -157,6 +162,19 @@ def mlir_sparsify(input_data_str):
     Sparsified model in serialized form (e.g. a TFLITE model).
   """
   return wrap_toco.wrapped_experimental_mlir_sparsify(input_data_str)
+
+
+def register_custom_opdefs(custom_opdefs_list):
+  """Register the given custom opdefs to the TensorFlow global op registry.
+
+  Args:
+    custom_opdefs_list: String representing the custom ops OpDefs that are
+      included in the GraphDef.
+
+  Returns:
+    True if the registration is successfully completed.
+  """
+  return wrap_toco.wrapped_register_custom_opdefs(custom_opdefs_list)
 
 
 def toco_convert_protos(model_flags_str,
@@ -288,7 +306,7 @@ Alternative, use virtualenv.""")
         pass
 
 
-def build_toco_flags(inference_type=lite_constants.FLOAT,
+def build_toco_flags(inference_type=dtypes.float32,
                      inference_input_type=None,
                      input_format=lite_constants.TENSORFLOW_GRAPHDEF,
                      output_format=lite_constants.TFLITE,
@@ -303,6 +321,7 @@ def build_toco_flags(inference_type=lite_constants.FLOAT,
                      dump_graphviz_video=False,
                      target_ops=None,
                      conversion_summary_dir=None,
+                     select_user_tf_ops=None,
                      **_):
   """Build the TOCO flags object from params."""
   toco = _toco_flags_pb2.TocoFlags()
@@ -319,6 +338,8 @@ def build_toco_flags(inference_type=lite_constants.FLOAT,
   toco.allow_custom_ops = allow_custom_ops
   if custom_opdefs:
     toco.custom_opdefs.extend(custom_opdefs)
+  if select_user_tf_ops:
+    toco.select_user_tf_ops.extend(select_user_tf_ops)
   toco.post_training_quantize = post_training_quantize
   toco.quantize_to_float16 = quantize_to_float16
   if default_ranges_stats:
@@ -339,7 +360,7 @@ def build_toco_flags(inference_type=lite_constants.FLOAT,
 
 def build_toco_convert_protos(input_tensors,
                               output_tensors,
-                              inference_type=lite_constants.FLOAT,
+                              inference_type=dtypes.float32,
                               inference_input_type=None,
                               input_format=lite_constants.TENSORFLOW_GRAPHDEF,
                               input_shapes=None,
@@ -362,7 +383,8 @@ def build_toco_convert_protos(input_tensors,
                               saved_model_dir=None,
                               saved_model_version=0,
                               saved_model_tags=None,
-                              saved_model_exported_names=None):
+                              saved_model_exported_names=None,
+                              select_user_tf_ops=None):
   """Builds protocol buffers describing a conversion of a model using TOCO.
 
   Typically this is to convert from TensorFlow GraphDef to TFLite, in which
@@ -440,6 +462,9 @@ def build_toco_convert_protos(input_tensors,
     saved_model_exported_names: Names to be exported (default: export all) when
       the saved model import path is on. This value will be set only when the
       SavedModel import path will be used.
+    select_user_tf_ops: List of user's defined TensorFlow ops need to be
+      supported in the TensorFlow Lite runtime. These ops will be supported as
+      select TensorFlow ops.
 
   Returns:
     model_flags, toco_flags, debug_info: three protocol buffers describing the
@@ -458,7 +483,7 @@ def build_toco_convert_protos(input_tensors,
                           allow_custom_ops, custom_opdefs,
                           post_training_quantize, quantize_to_float16,
                           dump_graphviz_dir, dump_graphviz_video, target_ops,
-                          conversion_summary_dir)
+                          conversion_summary_dir, select_user_tf_ops)
   model = _model_flags_pb2.ModelFlags()
   model.change_concat_input_ranges = change_concat_input_ranges
   for idx, input_tensor in enumerate(input_tensors):
@@ -478,15 +503,19 @@ def build_toco_convert_protos(input_tensors,
     else:
       shape = input_shapes[idx]
 
-    # Create shapes with -1 for unknown dimensions.
-    dims = []
-    for dim in shape:
-      if (dim is None or
-          (isinstance(dim, tensor_shape.Dimension) and dim.value is None)):
-        dims.append(-1)
-      else:
-        dims.append(int(dim))
-    input_array.shape.dims.extend(dims)
+    if shape.rank is not None:
+      # Create shapes with -1 for unknown dimensions.
+      dims = []
+      for dim in shape:
+        if (dim is None or
+            (isinstance(dim, tensor_shape.Dimension) and dim.value is None)):
+          dims.append(-1)
+        else:
+          dims.append(int(dim))
+      input_array.shape.dims.extend(dims)
+      input_array.shape.unknown_rank = False
+    else:
+      input_array.shape.unknown_rank = True
 
   for output_tensor in output_tensors:
     if saved_model_dir:

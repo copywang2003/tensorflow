@@ -51,6 +51,7 @@ limitations under the License.
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/profiler/lib/traceme.h"
+#include "tensorflow/core/protobuf/error_codes.pb.h"
 #include "tensorflow/core/util/device_name_utils.h"
 #if !defined(IS_MOBILE_PLATFORM)
 #include "tensorflow/core/distributed_runtime/eager/eager_client.h"
@@ -171,10 +172,11 @@ Status CopyInputToExpectedDevice(EagerContext* ctx, EagerOperation* op,
                         /* mirror= */ true, &result_handle);
   activity.Stop();
   if (!status.ok()) {
-    return errors::Internal("Failed copying input tensor from ",
-                            handle_device->name(), " to ",
-                            expected_input_device->name(), " in order to run ",
-                            op->Name(), ": ", status.error_message());
+    return Status(
+        status.code(),
+        absl::StrCat("Failed copying input tensor from ", handle_device->name(),
+                     " to ", expected_input_device->name(), " in order to run ",
+                     op->Name(), ": ", status.error_message()));
   }
 
   *result = result_handle;
@@ -730,8 +732,23 @@ Status EagerLocalExecute(EagerOperation* op, TensorHandle** retvals,
   TF_RETURN_IF_ERROR(executor.status());
 
   core::RefCountPtr<KernelAndDevice> kernel;
-  TF_RETURN_IF_ERROR(
-      GetOrCreateKernelAndDevice(op, retvals, num_retvals, &kernel));
+  auto status = GetOrCreateKernelAndDevice(op, retvals, num_retvals, &kernel);
+
+  // Run all the registered rewrite pass after the placement, regardless whether
+  // the placement is successful or not. The passes can either create new ops
+  // (without placement) or update some fields of the input op.
+  std::unique_ptr<tensorflow::EagerOperation> out_op;
+  TF_RETURN_IF_ERROR(EagerOpRewriteRegistry::Global()->RunRewrite(
+      EagerOpRewriteRegistry::POST_PLACEMENT, op, &out_op));
+  if (out_op) {
+    op = out_op.get();
+    // If the out op doesn't have device, either because it is a new op or
+    // the op wasn't placed successfully, then we do the placement again.
+    if (op->Device() == kVariantDeviceNull) {
+      status = GetOrCreateKernelAndDevice(op, retvals, num_retvals, &kernel);
+    }
+  }
+  if (!status.ok()) return status;
 
   int num_outputs = kernel->num_outputs();
   TF_RETURN_IF_ERROR(ValidateInputTypeAndPlacement(&ctx, op, kernel));
@@ -903,11 +920,11 @@ Status EagerRemoteExecute(EagerOperation* op, TensorHandle** retvals,
         }
       }
       auto* input_handle = remote_op->add_op_inputs()->mutable_remote_handle();
-      // For a multi-device function, a remote RunComponentFunction request is
-      // not sent through StreamingEnqueueAsync. It could arrive at a remote
-      // worker before a remote execution request which produces an input of the
-      // component function. So we wait until the remote input is ready before
-      // serializing it.
+      // For a remote component function, a function execution request and an
+      // input generation request may come from different workers. We need to
+      // guarantee that the input generation request is processed before the
+      // function execution request, so wait until the remote input is ready
+      // before sending it to the multi-device function device.
       const bool wait_until_ready = op->is_function();
       TF_RETURN_IF_ERROR(ctx.RemoteMgr()->SerializeRemoteTensorHandle(
           input, wait_until_ready, input_handle, input_device,

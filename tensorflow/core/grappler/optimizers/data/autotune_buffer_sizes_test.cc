@@ -148,8 +148,6 @@ TEST_P(AutotuneSetting, AutotuneBufferSizesTest) {
             autotune);
 }
 
-INSTANTIATE_TEST_SUITE_P(Test, AutotuneSetting, ::testing::Values(false, true));
-
 class MultipleNodes : public ::testing::TestWithParam<std::tuple<bool, int64>> {
 };
 
@@ -259,6 +257,8 @@ TEST_P(MultipleNodes, AutotuneBufferSizesTest) {
 INSTANTIATE_TEST_SUITE_P(Test, MultipleNodes,
                          ::testing::Combine(::testing::Values(true, false),
                                             ::testing::Values(-1, 3)));
+
+INSTANTIATE_TEST_SUITE_P(Test, AutotuneSetting, ::testing::Values(false, true));
 
 }  // namespace
 }  // namespace grappler

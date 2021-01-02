@@ -2,7 +2,10 @@
 #   Contains the legacy TF RNN APIs (internal TensorFlow version).
 
 package(
-    default_visibility = ["//tensorflow:__subpackages__"],
+    default_visibility = [
+        "//tensorflow:__subpackages__",
+        "//tensorflow/python/keras:__subpackages__",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -38,6 +41,7 @@ py_library(
         "//tensorflow/python/keras:initializers",
         "//tensorflow/python/keras/engine:input_spec",
         "//tensorflow/python/keras/legacy_tf_layers:layers_base",
+        "//tensorflow/python/keras/saving",
         "//tensorflow/python/keras/utils:tf_utils",
         "//tensorflow/python/training/tracking:base",
     ],

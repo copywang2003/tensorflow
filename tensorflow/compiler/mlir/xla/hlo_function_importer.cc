@@ -26,14 +26,15 @@ limitations under the License.
 #include "mlir/IR/Attributes.h"  // from @llvm-project
 #include "mlir/IR/BlockAndValueMapping.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
+#include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
 #include "mlir/IR/Identifier.h"  // from @llvm-project
 #include "mlir/IR/Location.h"  // from @llvm-project
 #include "mlir/IR/Region.h"  // from @llvm-project
-#include "mlir/IR/StandardTypes.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/hlo/include/mlir-hlo/Dialect/mhlo/IR/hlo_ops.h"
 #include "tensorflow/compiler/mlir/tensorflow/utils/error_util.h"
 #include "tensorflow/compiler/mlir/xla/attribute_importer.h"
 #include "tensorflow/compiler/mlir/xla/hlo_utils.h"
+#include "tensorflow/compiler/xla/comparison_util.h"
 #include "tensorflow/compiler/xla/protobuf_util.h"
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
@@ -77,6 +78,30 @@ bool DotIsDefault(const HloInstruction* instruction) {
   default_dimension_numbers.add_rhs_contracting_dimensions(0);
   return xla::protobuf_util::ProtobufEquals(dnums, default_dimension_numbers);
 }
+
+// Returns an MLIR Location generated from HLO Instruction. Uses instruction
+// metadata if present or instruction name.
+mlir::Location GenerateInstructionLocation(HloInstruction* instruction,
+                                           mlir::OpBuilder* func_builder) {
+  const std::string& op_name = instruction->metadata().op_name();
+  if (op_name.empty()) {
+    return mlir::NameLoc::get(func_builder->getIdentifier(instruction->name()),
+                              func_builder->getContext());
+  }
+
+  mlir::Location op_name_loc = mlir::NameLoc::get(
+      func_builder->getIdentifier(op_name), func_builder->getContext());
+  const std::string& source_file = instruction->metadata().source_file();
+  if (source_file.empty()) {
+    return op_name_loc;
+  }
+
+  return mlir::FusedLoc::get(
+      {op_name_loc, mlir::FileLineColLoc::get(
+                        source_file, instruction->metadata().source_line(), 0,
+                        func_builder->getContext())},
+      func_builder->getContext());
+}
 }  // namespace
 
 Status HloFunctionImporter::ImportAsFunc(
@@ -102,7 +127,7 @@ StatusOr<mlir::FuncOp> HloFunctionImporter::ImportAsFunc(
   llvm::SmallVector<Type, 4> args, rets;
   TF_RETURN_IF_ERROR(GetMlirTypes(computation.parameter_instructions(), &args));
   TF_RETURN_IF_ERROR(GetMlirTypes({computation.root_instruction()}, &rets));
-  auto func_type = mlir::FunctionType::get(args, rets, context_);
+  auto func_type = mlir::FunctionType::get(context_, args, rets);
 
   string computation_name =
       computation.parent()->entry_computation() == &computation
@@ -140,30 +165,41 @@ tensorflow::Status HloFunctionImporter::ImportAsRegion(
   return ImportInstructions(computation, block);
 }
 
-tensorflow::Status HloFunctionImporter::ImportInstructions(
-    const HloComputation& computation, mlir::Block* block) {
+StatusOr<Value> HloFunctionImporter::ImportInstructionsImpl(
+    const xla::HloComputation& computation,
+    const llvm::SmallVectorImpl<Value>& arguments, mlir::OpBuilder* builder) {
   // Setup the input parameters.
   const int num_parameters = computation.num_parameters();
+
+  if (arguments.size() != num_parameters)
+    return InvalidArgument("Caller vs callee argument sizes do not match");
+
   for (int i = 0; i < num_parameters; i++) {
     auto hlo_parameter = computation.parameter_instruction(i);
-    instruction_value_map_[hlo_parameter] = block->getArgument(i);
+    instruction_value_map_[hlo_parameter] = arguments[i];
   }
 
-  mlir::OpBuilder builder = mlir::OpBuilder::atBlockEnd(block);
   for (auto instruction : computation.MakeInstructionPostOrder()) {
     TF_ASSIGN_OR_RETURN(auto new_operation,
-                        ImportInstruction(instruction, &builder));
+                        ImportInstruction(instruction, builder));
     if (new_operation) {
       instruction_value_map_[instruction] = new_operation->getResult(0);
     }
   }
 
+  // Setup the return type (HLO only supports a single return value).
+  return GetMlirValue(computation.root_instruction());
+}
+
+Status HloFunctionImporter::ImportInstructions(
+    const HloComputation& computation, mlir::Block* block) {
+  llvm::SmallVector<Value, 4> arguments(block->args_begin(), block->args_end());
+  mlir::OpBuilder builder = mlir::OpBuilder::atBlockEnd(block);
+  TF_ASSIGN_OR_RETURN(Value result,
+                      ImportInstructionsImpl(computation, arguments, &builder));
+
   // TODO(suderman): Add location tracking details.
   mlir::Location loc = builder.getUnknownLoc();
-
-  // Setup the return type (HLO only supports a single return value).
-  TF_ASSIGN_OR_RETURN(auto result,
-                      GetMlirValue(computation.root_instruction()));
 
   // Create terminator op depending on the parent op of this region.
   if (llvm::isa<FuncOp>(block->getParentOp())) {
@@ -174,14 +210,25 @@ tensorflow::Status HloFunctionImporter::ImportInstructions(
   return tensorflow::Status::OK();
 }
 
+StatusOr<Value> HloFunctionImporter::ImportInstructions(
+    const xla::HloComputation& computation,
+    const llvm::SmallVectorImpl<Value>& arguments, mlir::OpBuilder* builder) {
+  mlir::Block* block = builder->getBlock();
+  if (block == nullptr)
+    return InvalidArgument(
+        "ImportInstructions requires a valid block in the builder");
+
+  HloFunctionImporter importer(
+      block->getParent()->getParentOfType<mlir::ModuleOp>(), {}, builder);
+  return importer.ImportInstructionsImpl(computation, arguments, builder);
+}
+
 StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
     HloInstruction* instruction, mlir::OpBuilder* func_builder) {
   TF_ASSIGN_OR_RETURN(auto operands, GetOperands(instruction));
   TF_ASSIGN_OR_RETURN(auto result_type, ConvertShapeToType<RankedTensorType>(
                                             instruction->shape(), *builder_));
-  mlir::Location loc =
-      mlir::NameLoc::get(func_builder->getIdentifier(instruction->name()),
-                         func_builder->getContext());
+  mlir::Location loc = GenerateInstructionLocation(instruction, func_builder);
 
   llvm::SmallVector<NamedAttribute, 10> attributes;
   switch (instruction->opcode()) {
@@ -193,7 +240,7 @@ StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       auto attr = CreateDenseElementsAttrFromLiteral(literal, *builder_);
       if (!attr.ok()) return attr.status();
       mlir::Operation* new_operation =
-          func_builder->create<mlir::ConstantOp>(loc, attr.ValueOrDie());
+          func_builder->create<mlir::mhlo::ConstOp>(loc, attr.ValueOrDie());
       for (auto attr : attributes) {
         new_operation->setAttr(attr.first, attr.second);
       }
@@ -281,7 +328,12 @@ StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
       MakeAndReturn(CustomCallOp);
     }
     case HloOpcode::kCompare: {
-      attributes.push_back(ConvertComparisonDirection(instruction));
+      auto compare = Cast<HloCompareInstruction>(instruction);
+      attributes.push_back(ConvertComparisonDirection(compare->direction()));
+      auto default_type = Comparison::DefaultComparisonType(
+          compare->operand(0)->shape().element_type());
+      if (compare->type() != default_type)
+        attributes.push_back(ConvertComparisonType(compare->type()));
       MakeAndReturn(CompareOp);
     }
     case HloOpcode::kCholesky: {
@@ -403,8 +455,7 @@ StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
     }
     case HloOpcode::kSetDimensionSize: {
       attributes.push_back(builder_->getNamedAttr(
-          "dimension", builder_->getIntegerAttr(builder_->getIntegerType(32),
-                                                instruction->dimension())));
+          "dimension", builder_->getI64IntegerAttr(instruction->dimension())));
       MakeAndReturn(SetDimensionSizeOp);
     }
     case HloOpcode::kSlice: {
@@ -486,7 +537,8 @@ StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
     }
     case HloOpcode::kAllReduce: {
       auto all_reduce = Cast<HloAllReduceInstruction>(instruction);
-      attributes.push_back(ConvertReplicaGroups(all_reduce->replica_groups()));
+      attributes.push_back(
+          ConvertReplicaGroups(all_reduce->replica_groups(), *builder_));
       attributes.push_back(ConvertChannelHandle(all_reduce->channel_id()));
       auto all_reduce_op = func_builder->create<mlir::mhlo::AllReduceOp>(
           loc, result_type, operands, attributes);
@@ -559,8 +611,7 @@ StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
     };
     case HloOpcode::kGetDimensionSize: {
       attributes.push_back(builder_->getNamedAttr(
-          "dimension", builder_->getIntegerAttr(builder_->getIntegerType(32),
-                                                instruction->dimension())));
+          "dimension", builder_->getI64IntegerAttr(instruction->dimension())));
       MakeAndReturn(GetDimensionSizeOp);
     };
     case HloOpcode::kTranspose: {
@@ -635,9 +686,9 @@ StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstructionImpl(
           builder_->getNamedAttr("window_strides", Convert(strides)));
       attributes.push_back(ConvertPadding(paddings));
       attributes.push_back(
-          builder_->getNamedAttr("lhs_dilations", Convert(lhs_dilations)));
+          builder_->getNamedAttr("lhs_dilation", Convert(lhs_dilations)));
       attributes.push_back(
-          builder_->getNamedAttr("rhs_dilations", Convert(rhs_dilations)));
+          builder_->getNamedAttr("rhs_dilation", Convert(rhs_dilations)));
       attributes.push_back(builder_->getNamedAttr(
           "dimension_numbers",
           ConvertConvDimensionNumbers(
@@ -782,13 +833,11 @@ StatusOr<mlir::Operation*> HloFunctionImporter::ImportInstruction(
   // Minor-to-major is a permutation of [0, rank), presenting tensor dimensions
   // in physical minor-to-major order.
   if (instruction->shape().IsArray() &&
+      !instruction->shape().layout().minor_to_major().empty() &&
       instruction->shape().layout() !=
           LayoutUtil::MakeDescendingLayout(
               instruction->shape().dimensions().size())) {
-    llvm::SmallVector<int64_t, 4> minor_to_major(
-        instruction->shape().layout().minor_to_major().begin(),
-        instruction->shape().layout().minor_to_major().end());
-    op->setAttr("minor_to_major", builder_->getIndexTensorAttr(minor_to_major));
+    SetLayoutForMlir(op, instruction->shape());
   }
   return op;
 }
@@ -830,11 +879,16 @@ StatusOr<Value> HloFunctionImporter::GetMlirValue(HloInstruction* instruction) {
 }
 
 mlir::NamedAttribute HloFunctionImporter::ConvertComparisonDirection(
-    HloInstruction* instruction) {
+    ComparisonDirection direction) {
   return builder_->getNamedAttr(
       "comparison_direction",
-      builder_->getStringAttr(
-          ComparisonDirectionToString(instruction->comparison_direction())));
+      builder_->getStringAttr(ComparisonDirectionToString(direction)));
+}
+
+mlir::NamedAttribute HloFunctionImporter::ConvertComparisonType(
+    Comparison::Type type) {
+  return builder_->getNamedAttr(
+      "compare_type", builder_->getStringAttr(ComparisonTypeToString(type)));
 }
 
 mlir::DenseIntElementsAttr HloFunctionImporter::ConvertDimensions(
@@ -879,7 +933,7 @@ mlir::NamedAttribute HloFunctionImporter::ConvertSourceTargetPairs(
 }
 
 mlir::NamedAttribute HloFunctionImporter::ConvertReplicaGroups(
-    const std::vector<ReplicaGroup>& replica_groups) {
+    const std::vector<ReplicaGroup>& replica_groups, mlir::Builder builder) {
   int64_t num_groups = replica_groups.size();
   int64_t group_size =
       num_groups == 0 ? 0 : replica_groups[0].replica_ids_size();
@@ -891,9 +945,9 @@ mlir::NamedAttribute HloFunctionImporter::ConvertReplicaGroups(
       attr[flat_index++] = group.replica_ids(i);
   }
   auto type = mlir::RankedTensorType::get({num_groups, group_size},
-                                          builder_->getIntegerType(64));
-  return builder_->getNamedAttr("replica_groups",
-                                DenseIntElementsAttr::get(type, attr));
+                                          builder.getIntegerType(64));
+  return builder.getNamedAttr("replica_groups",
+                              DenseIntElementsAttr::get(type, attr));
 }
 
 mlir::NamedAttribute HloFunctionImporter::ConvertChannelHandle(
@@ -910,6 +964,16 @@ mlir::NamedAttribute HloFunctionImporter::ConvertChannelHandle(
       mlir::mhlo::ChannelHandle::get(
           builder_->getI64IntegerAttr(channel.handle()),
           builder_->getI64IntegerAttr(channel.type()), context_));
+}
+
+void HloFunctionImporter::SetLayoutForMlir(mlir::Operation* op,
+                                           const Shape& shape) {
+  llvm::SmallVector<int64_t, 4> minor_to_major(
+      shape.layout().minor_to_major().begin(),
+      shape.layout().minor_to_major().end());
+  op->setAttr(
+      "minor_to_major",
+      mlir::Builder(op->getContext()).getIndexTensorAttr(minor_to_major));
 }
 
 }  // namespace xla
